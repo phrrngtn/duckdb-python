@@ -14,6 +14,8 @@
 #include "duckdb_python/pyrelation.hpp"
 #include <duckdb/main/settings.hpp>
 
+using namespace pybind11::literals; // for _a keyword argument syntax
+
 namespace duckdb {
 
 static void CreateArrowScan(const string &name, py::object entry, TableFunctionRef &table_function,
@@ -308,6 +310,33 @@ unique_ptr<TableRef> PythonReplacementScan::Replace(ClientContext &context, Repl
 	unique_ptr<TableRef> result;
 	result = ReplaceInternal(context, table_name);
 	return result;
+}
+
+unique_ptr<TableRef> PythonCallbackReplacementScan(ClientContext &context, ReplacementScanInput &input,
+                                                   optional_ptr<ReplacementScanData> data) {
+	auto &config = DBConfig::GetConfig(context);
+	if (!Settings::Get<EnableExternalAccessSetting>(config)) {
+		return nullptr;
+	}
+	if (!data) {
+		return nullptr;
+	}
+	auto &scan_data = data->Cast<PythonCallbackReplacementScanData>();
+
+	py::gil_scoped_acquire acquire;
+	py::object result;
+	try {
+		result = scan_data.callback("table_name"_a = py::str(input.table_name),
+		                            "schema_name"_a = py::str(input.schema_name),
+		                            "catalog_name"_a = py::str(input.catalog_name));
+	} catch (py::error_already_set &e) {
+		return nullptr;
+	}
+	if (result.is_none()) {
+		return nullptr;
+	}
+	// Feed through the existing machinery that handles DataFrames, Arrow, etc.
+	return PythonReplacementScan::TryReplacementObject(result, input.table_name, context);
 }
 
 } // namespace duckdb

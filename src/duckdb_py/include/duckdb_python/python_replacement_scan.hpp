@@ -8,6 +8,24 @@
 
 namespace duckdb {
 
+//! ReplacementScanData subclass that holds a Python callable.
+//! The callable signature is: callback(table_name: str) -> Optional[scannable]
+//! where scannable is a pandas DataFrame, pyarrow Table/Dataset/RecordBatchReader,
+//! DuckDBPyRelation, or any object supporting __arrow_c_stream__.
+struct PythonCallbackReplacementScanData : public ReplacementScanData {
+	explicit PythonCallbackReplacementScanData(py::function callback_p)
+	    : callback(std::move(callback_p)) {}
+	~PythonCallbackReplacementScanData() override {
+		py::gil_scoped_acquire acquire;
+		callback = py::function();
+	}
+	py::function callback;
+};
+
+//! Replacement scan function that delegates to a user-registered Python callback.
+unique_ptr<TableRef> PythonCallbackReplacementScan(ClientContext &context, ReplacementScanInput &input,
+                                                   optional_ptr<ReplacementScanData> data);
+
 struct PythonReplacementScan {
 public:
 	static unique_ptr<TableRef> Replace(ClientContext &context, ReplacementScanInput &input,
