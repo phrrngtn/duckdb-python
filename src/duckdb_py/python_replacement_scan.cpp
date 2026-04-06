@@ -11,8 +11,15 @@
 #include "duckdb/common/typedefs.hpp"
 #include "duckdb_python/pandas/pandas_scan.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
+#include "duckdb/parser/tableref/basetableref.hpp"
+#include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/statement/select_statement.hpp"
+#include "duckdb/parser/query_node/select_node.hpp"
+#include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb_python/pyrelation.hpp"
 #include <duckdb/main/settings.hpp>
+
+using namespace pybind11::literals; // for _a keyword argument syntax
 
 namespace duckdb {
 
@@ -308,6 +315,134 @@ unique_ptr<TableRef> PythonReplacementScan::Replace(ClientContext &context, Repl
 	unique_ptr<TableRef> result;
 	result = ReplaceInternal(context, table_name);
 	return result;
+}
+
+// Handle a dict-based replacement scan directive from the Python callback.
+//
+// The dict must contain a "type" key that determines the replacement strategy:
+//
+// {"type": "table", "catalog": "...", "schema": "...", "table": "..."}
+//   Redirects the unresolved name to an existing catalog entry. Constructs a
+//   BaseTableRef wrapped in a SubqueryRef (the wrapping is necessary because the
+//   binder's replacement scan code overwrites the alias on non-SubqueryRef results,
+//   which would break user-provided aliases like "FROM products AS p").
+//   The binder resolves the redirected name through normal catalog lookup, so full
+//   optimizer pushdown applies — predicates, projections, partition pruning, etc.
+//
+// {"type": "query", "sql": "SELECT ..."}
+//   Rewrites the unresolved name as an arbitrary SQL subquery. The SQL is parsed
+//   using DuckDB's Parser directly (not through ClientContext::ParseStatements),
+//   which avoids acquiring the ClientContext lock — critical because the binder
+//   already holds that lock when the replacement scan fires. The parsed AST is
+//   wrapped in a SubqueryRef and the optimizer sees through it.
+//
+// Both paths produce pure AST nodes with no connection dependencies and no data
+// copying. The binder on the active connection resolves all table references in
+// the constructed AST against its own catalog.
+static unique_ptr<TableRef> HandleDictDirective(const py::dict &directive, const string &table_name,
+                                                ClientContext &context) {
+	if (!directive.contains("type")) {
+		throw InvalidInputException("Replacement scan directive dict must contain a 'type' key");
+	}
+	auto type_str = py::str(directive["type"]).cast<string>();
+
+	if (type_str == "table") {
+		auto base_ref = make_uniq<BaseTableRef>();
+		if (directive.contains("catalog")) {
+			base_ref->catalog_name = py::str(directive["catalog"]).cast<string>();
+		}
+		if (directive.contains("schema")) {
+			base_ref->schema_name = py::str(directive["schema"]).cast<string>();
+		}
+		if (directive.contains("table")) {
+			base_ref->table_name = py::str(directive["table"]).cast<string>();
+		} else {
+			base_ref->table_name = table_name;
+		}
+
+		auto select_node = make_uniq<SelectNode>();
+		select_node->select_list.push_back(make_uniq<StarExpression>());
+		select_node->from_table = std::move(base_ref);
+		auto select_stmt = make_uniq<SelectStatement>();
+		select_stmt->node = std::move(select_node);
+		auto subquery = make_uniq<SubqueryRef>(std::move(select_stmt));
+		subquery->alias = table_name;
+		return std::move(subquery);
+	}
+
+	if (type_str == "query") {
+		// SQL rewrite: {"type": "query", "sql": "SELECT ..."}
+		if (!directive.contains("sql")) {
+			throw InvalidInputException("Replacement scan directive with type 'query' must contain a 'sql' key");
+		}
+		auto sql = py::str(directive["sql"]).cast<string>();
+
+		// Parse the SQL directly — no lock needed, Parser is stateless.
+		ParserOptions options;
+		options.preserve_identifier_case = true;
+		Parser parser(options);
+		parser.ParseQuery(sql);
+
+		if (parser.statements.empty()) {
+			throw InvalidInputException("Replacement scan SQL produced no statements");
+		}
+		if (parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
+			throw InvalidInputException("Replacement scan SQL must be a SELECT statement");
+		}
+
+		auto select_stmt = unique_ptr_cast<SQLStatement, SelectStatement>(std::move(parser.statements[0]));
+		auto subquery = make_uniq<SubqueryRef>(std::move(select_stmt));
+		subquery->alias = table_name;
+		return std::move(subquery);
+	}
+
+	throw InvalidInputException("Unknown replacement scan directive type: '%s' (expected 'table' or 'query')",
+	                            type_str);
+}
+
+// Entry point for user-registered replacement scans. Called by DuckDB's binder
+// when it encounters an unresolved table name. The binder holds the ClientContext
+// lock at this point, so the callback must not call back into the same connection
+// (con.sql(), con.execute(), etc.) — that would deadlock.
+//
+// The GIL is acquired before calling into Python. If the callback raises a Python
+// exception, we catch it and return nullptr (decline), letting DuckDB try the next
+// replacement scan in the chain.
+unique_ptr<TableRef> PythonCallbackReplacementScan(ClientContext &context, ReplacementScanInput &input,
+                                                   optional_ptr<ReplacementScanData> data) {
+	auto &config = DBConfig::GetConfig(context);
+	if (!Settings::Get<EnableExternalAccessSetting>(config)) {
+		return nullptr;
+	}
+	if (!data) {
+		return nullptr;
+	}
+	auto &scan_data = data->Cast<PythonCallbackReplacementScanData>();
+
+	py::gil_scoped_acquire acquire;
+	py::object result;
+	try {
+		result = scan_data.callback("table_name"_a = py::str(input.table_name),
+		                            "schema_name"_a = py::str(input.schema_name),
+		                            "catalog_name"_a = py::str(input.catalog_name));
+	} catch (py::error_already_set &e) {
+		return nullptr;
+	}
+
+	// Callback returned None: decline, let the next replacement scan try.
+	if (result.is_none()) {
+		return nullptr;
+	}
+
+	// Callback returned a dict: structured directive (name redirect or SQL rewrite).
+	// These paths construct AST nodes without any connection interaction.
+	if (py::isinstance<py::dict>(result)) {
+		return HandleDictDirective(result.cast<py::dict>(), input.table_name, context);
+	}
+
+	// Callback returned a Python object (DataFrame, Arrow Table, etc.):
+	// use the existing machinery to convert it into a scannable TableRef.
+	return PythonReplacementScan::TryReplacementObject(result, input.table_name, context);
 }
 
 } // namespace duckdb
